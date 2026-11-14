@@ -116,13 +116,40 @@ async fn session(state: &AppState, name: &str, execution: uuid::Uuid) -> Result<
         .max_frame_size(Some(64 * 1024))
         .write_buffer_size(16 * 1024)
         .max_write_buffer_size(64 * 1024);
-    let (mut socket, _) = tokio::time::timeout(
+    let handshake = tokio::time::timeout(
         Duration::from_secs(connection.timeout_seconds),
         client_async_tls_with_config(request, socket, Some(limits), None),
     )
-    .await
-    .map_err(|_| "UPS notification handshake timed out")?
-    .map_err(|_| "UPS notification handshake failed")?;
+    .await;
+    let (mut socket, _) = match handshake {
+        Ok(Ok(stream)) => stream,
+        // No channel: degrade to polling, but only after holding the filtered
+        // deletion lock. A peer may answer 201 to the Subscribe POST even without
+        // a WebSocket server (PS3.18 §11.10), so creation stays lock-protected.
+        Ok(Err(_)) | Err(_) => {
+            let poll_only: bool =
+                query_scalar("SELECT poll_only FROM dicom_ups_sources WHERE connection_name=$1")
+                    .bind(name)
+                    .fetch_one(&mut *lock)
+                    .await
+                    .map_err(|_| "Cannot read UPS poll-only state")?;
+            if poll_only {
+                // Already degraded once; do not pile up duplicate subscriptions
+                // on every retry cycle.
+                return Err("UPS notification connection is unavailable".into());
+            }
+            let client = Client::new(connection, policy)?;
+            client.subscribe(&prefix).await?;
+            query("UPDATE dicom_ups_sources SET poll_only=true WHERE connection_name=$1 AND NOT poll_only")
+                .bind(name)
+                .execute(&mut *lock)
+                .await
+                .map_err(|_| "Cannot persist UPS poll-only state")?;
+            return Err(
+                "UPS notification connection is unavailable; polling fallback is active".into(),
+            );
+        }
+    };
     // Never infer subscription durability from an open WebSocket. Establish the
     // filtered deletion lock, then recover every known active item by fresh queries.
     let client = Client::new(connection, policy)?;
@@ -164,7 +191,7 @@ async fn heartbeat(
     OperationContext::for_service(state, &config.client_id, &config.scopes)
         .await
         .map_err(|_| "UPS service identity is unavailable")?;
-    let updated=query("UPDATE dicom_ups_sources SET watch_ready_until=clock_timestamp()+interval '15 seconds',watch_error=NULL,updated_at=clock_timestamp() WHERE connection_name=$1 AND watch_execution=$2").bind(name).bind(execution).execute(state.db_pool.as_ref()).await.map_err(|_|"Cannot renew UPS watcher")?;
+    let updated=query("UPDATE dicom_ups_sources SET watch_ready_until=clock_timestamp()+interval '15 seconds',watch_error=NULL,poll_only=false,updated_at=clock_timestamp() WHERE connection_name=$1 AND watch_execution=$2").bind(name).bind(execution).execute(state.db_pool.as_ref()).await.map_err(|_|"Cannot renew UPS watcher")?;
     if updated.rows_affected() != 1 {
         return Err("UPS watcher lost its source fence".into());
     }
